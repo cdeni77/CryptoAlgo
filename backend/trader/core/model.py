@@ -150,8 +150,19 @@ class ForecastModel:
         member against the SAME inner block, so they tend to stop together --
         which is the point: the ensemble does not average that decision away.
         """
-        return tuple(int(getattr(b, 'best_iteration', 0) or 0)
-                     for b in self.boosters)
+        def kept(b) -> int:
+            # `best_iteration` is set ONLY when early stopping ran. Without it
+            # the attribute is 0, which would report a fully trained booster as
+            # a degenerate one -- the exact misreading this property exists to
+            # prevent. Fall back to the trees the booster actually holds.
+            stopped = int(getattr(b, 'best_iteration', 0) or 0)
+            if stopped > 0:
+                return stopped
+            try:
+                return int(b.num_trees())
+            except Exception:                                  # noqa: BLE001
+                return 0
+        return tuple(kept(b) for b in self.boosters)
 
     def member_corrections(self, table: pd.DataFrame) -> np.ndarray:
         """Each member's raw logit correction, shape (members, rows)."""
@@ -388,6 +399,57 @@ class ForecastModel:
         model.verify(config)
         logger.debug('artifact integrity: %s', model.integrity())
         return model
+
+
+def _rounds_from_cv(params: dict, frame, make_dataset, config) -> int:
+    """Tree count read off a validation curve averaged over k splits.
+
+    The inner block holds ~10% of the training windows, and its log-loss
+    standard error is ~0.013 against effects of ~0.0002 -- so a count chosen on
+    it is noise, and measured counts swing 1 to 167 across adjacent weeks.
+    Averaging the curve over k splits covers EVERY training row instead of a
+    tenth, and the stopping decision needs the curve's shape rather than its
+    level: shape stabilises long before level resolves.
+
+    Returns the config's `n_estimators` if the splits cannot be formed, which
+    is the same answer as `early_stopping_mode='off'` -- not a silent zero.
+    """
+    import lightgbm as lgb
+    k = max(int(getattr(config, 'cv_early_stopping_folds', 5) or 5), 2)
+    n = len(frame)
+    ceiling = int(config.n_estimators)
+    if n < k * MIN_SHRINKAGE_ROWS:
+        logger.warning(
+            'cv early stopping needs %d rows for %d splits and has %d; using '
+            'the full %d rounds instead', k * MIN_SHRINKAGE_ROWS, k, n, ceiling)
+        return ceiling
+    # Contiguous blocks, not random rows: neighbouring minutes of the same
+    # window are not independent, and a random split would leak across them.
+    bounds = np.linspace(0, n, k + 1, dtype=int)
+    curves = []
+    for i in range(k):
+        lo, hi = bounds[i], bounds[i + 1]
+        valid = frame.iloc[lo:hi]
+        train = pd.concat([frame.iloc[:lo], frame.iloc[hi:]])
+        if not len(valid) or not len(train):
+            continue
+        tr = make_dataset(train)
+        va = make_dataset(valid, reference=tr)
+        record: dict = {}
+        lgb.train(params, tr, num_boost_round=ceiling, valid_sets=[va],
+                  valid_names=['cv'], callbacks=[lgb.record_evaluation(record)])
+        curve = record.get('cv', {}).get('binary_logloss')
+        if curve:
+            curves.append(np.asarray(curve, dtype=float))
+    if not curves:
+        return ceiling
+    width = min(len(c) for c in curves)
+    mean_curve = np.mean([c[:width] for c in curves], axis=0)
+    best = int(np.argmin(mean_curve)) + 1
+    logger.info('cv early stopping over %d splits: %d rounds (curve min '
+                '%.6f at %d of %d)', len(curves), best, mean_curve.min(),
+                best, width)
+    return max(best, 1)
 
 
 def _fit_residual_scale(
@@ -634,6 +696,10 @@ def fit_model(
 
     features = list(populated)
     members = []
+    mode = str(getattr(config, 'early_stopping_mode', 'inner') or 'inner')
+    rounds: Optional[int] = None
+    def member_dataset(frame, reference=None):
+        return dataset(frame, frame_weights(frame), reference=reference)
     for k in range(max(int(getattr(config, 'ensemble_size', 1) or 1), 1)):
         params = {
             'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
@@ -651,12 +717,21 @@ def fit_model(
         train_set = dataset(fit_rows, fit_weights)
         valid_set = dataset(inner_valid, frame_weights(inner_valid),
                             reference=train_set)
-        members.append(lgb.train(
-            params, train_set, num_boost_round=config.n_estimators,
-            valid_sets=[valid_set], valid_names=['inner'],
-            callbacks=[lgb.early_stopping(config.early_stopping_rounds,
-                                          verbose=False)],
-        ))
+        if mode == 'inner':
+            members.append(lgb.train(
+                params, train_set, num_boost_round=config.n_estimators,
+                valid_sets=[valid_set], valid_names=['inner'],
+                callbacks=[lgb.early_stopping(config.early_stopping_rounds,
+                                              verbose=False)],
+            ))
+        else:
+            # `cv` and `off` fix the count ONCE for the ensemble: it is a
+            # hyperparameter the members share, and letting each re-derive it
+            # from the same small block is what produced one-tree members.
+            if rounds is None:
+                rounds = (_rounds_from_cv(params, fit_rows, member_dataset, config)
+                          if mode == 'cv' else int(config.n_estimators))
+            members.append(lgb.train(params, train_set, num_boost_round=rounds))
     booster = members[0]
 
     def mean_correction(frame: pd.DataFrame) -> np.ndarray:

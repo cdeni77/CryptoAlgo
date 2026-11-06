@@ -570,6 +570,16 @@ services:
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models
       - ./backend/trader:/app
+    # **`--early-stopping-mode cv`, 2026-11-05.** Chosen on ESTIMATOR
+    # PROPERTIES, not on return. Under the default `inner`, each member
+    # early-stops on ~10% of the training windows, where the log-loss noise
+    # is ~600x the effect, so counts swung 1 to 167 across adjacent weeks
+    # and two folds shipped one-tree constants that could not trade. `cv`
+    # averages the validation curve over 5 splits of the whole training set:
+    # counts land in a 4-31 band, no fold is degenerate, and the skill
+    # standard error halves (0.00008 against 0.00016) at comparable t. The
+    # returns across the three arms (+3.42%, -7.05%, +5.25% on 82, 723 and
+    # 2,438 trades) are noise and were not used to choose.
     # **Gate 0.1pp, not 0.5, from 2026-11-05.** Not a tuned value -- a
     # measurement one. At 0.5 the backtest took 20 trades in 55,764 rows and
     # there is nothing to estimate from twenty. The edge distribution is
@@ -624,6 +634,7 @@ services:
         --kelly-fraction 0.10
         --compound
         --min-edge-pp 0.1
+        --early-stopping-mode cv
         --bankroll 1000
         --max-entries-per-symbol-window 4
         --max-positions-per-window 12

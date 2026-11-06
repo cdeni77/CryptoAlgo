@@ -64,3 +64,28 @@ def test_the_backtest_actually_passes_the_count():
     src = inspect.getsource(backtest.walk_forward)
     assert 'n_trees=_member_trees(model)' in src, (
         'the fold line must receive EVERY member, not just best_iteration')
+
+
+def test_a_booster_without_early_stopping_reports_its_real_size():
+    """`best_iteration` is 0 unless early stopping ran.
+
+    Under `early_stopping_mode` 'cv' or 'off' no callback runs, so every
+    booster reports 0 and a fully trained 400-tree ensemble was printed as
+    "trees 0 <- DEGENERATE FIT" while placing 1,319 trades.
+    """
+    from core.model import ForecastModel
+
+    class Booster:
+        def __init__(self, stopped, size):
+            self.best_iteration = stopped
+            self._size = size
+        def num_trees(self):
+            return self._size
+
+    m = ForecastModel.__new__(ForecastModel)
+    object.__setattr__(m, 'members', [Booster(0, 400), Booster(0, 400)])
+    object.__setattr__(m, 'booster', None)
+    assert m.member_trees == (400, 400)
+
+    object.__setattr__(m, 'members', [Booster(17, 400)])
+    assert m.member_trees == (17,), 'early stopping wins when it ran'

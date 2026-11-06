@@ -228,6 +228,27 @@ class Config:
     colsample_bytree: float = 0.6
     reg_lambda: float = 10.0
     early_stopping_rounds: int = 40
+    # **How the tree count is chosen.** `inner` is the original: each ensemble
+    # member early-stops on the reserved inner block. That block is ~10% of the
+    # training windows -- about 1,500 rows -- and its log-loss standard error is
+    # ~0.013 against effects of ~0.0002, so the count is decided by noise and
+    # swings 1 to 167 across adjacent weeks. A fold that keeps one tree ships a
+    # constant and takes zero trades for reasons unrelated to the market.
+    #
+    # `cv` averages the validation curve over `cv_early_stopping_folds` splits
+    # of the training set, so the stopping point is read off a curve covering
+    # every training row rather than a tenth of them. The decision needs the
+    # curve's SHAPE, not the absolute effect, and averaging stabilises shape
+    # long before it resolves level.
+    #
+    # `off` trains a fixed `n_estimators` and lets the shrinkage regularise --
+    # the walk-forward alpha is the one estimate here that aggregates enough
+    # data to mean anything. It stops pretending to tune against a signal that
+    # would need ~6.25M rows to resolve, against 79,000 held.
+    early_stopping_mode: str = 'inner'
+    #: Splits of the training set used to average the validation curve under
+    #: `early_stopping_mode='cv'`.
+    cv_early_stopping_folds: int = 5
 
     # ---- cross-validation ------------------------------------------------
     # How the walk-forward timeline is cut. 'count' gives equal numbers of

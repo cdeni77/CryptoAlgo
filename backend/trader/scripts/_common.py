@@ -304,6 +304,14 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
                             'out-of-sample stage-1 prediction (default 4)')
     model.add_argument('--stack-intercept', action='store_true', default=None,
                        help='let stage 2 fit an intercept c in [-0.5, 0.5]')
+    model.add_argument('--early-stopping-mode',
+                       choices=('inner', 'cv', 'off'), default=None,
+                       help="How the tree count is chosen. 'inner' early-stops "
+                            'each member on the reserved inner block (~10% of '
+                            'training windows, where the log-loss noise is ~600x '
+                            "the effect). 'cv' averages the validation curve over "
+                            "k splits of the whole training set. 'off' trains a "
+                            'fixed n_estimators and lets the shrinkage regularise.')
     model.add_argument('--strike-source', choices=('proxy', 'venue'),
                        default=None,
                        help="'venue' builds windows from the venue's own "
@@ -419,6 +427,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
                 f'--exclude-price-band wants "LO,HI" like "0.35,0.65"; '
                 f'got {raw_band!r}')
     for field, attr in (
+        ('early_stopping_mode', 'early_stopping_mode'),
         ('venue', 'venue'), ('window_minutes', 'window_minutes'),
         ('baseline_distribution', 'baseline_distribution'), ('n_folds', 'n_folds'),
         ('embargo_minutes', 'embargo_minutes'),
