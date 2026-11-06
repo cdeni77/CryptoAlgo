@@ -152,6 +152,30 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument('--mode', choices=['paper', 'live'], default='paper')
+    # **The bar series every price-derived feature is built from.** The
+    # markets settle on CF Benchmarks BRTI, so that is the default; Coinbase
+    # is a different series and the basis does not cancel between the strike
+    # and the decision. This must be expressible here or the live loop can
+    # only ever run the config default, which is how a measured improvement
+    # sat unused from 2026-10-22: the research path could ask for BRTI and
+    # the live path had no way to say it.
+    parser.add_argument('--venue', type=str, default=None,
+                        help='Bar series to score on (default: the config, '
+                             'cfbenchmarks). Must match the artifact, which '
+                             'the provenance check now enforces.')
+    # **Where the barrier and the grade come from.** The retrain passes both;
+    # without them here the trader silently ran the Config defaults ('proxy'
+    # for each) against artifacts fitted on the venue's own strike and
+    # settlement -- a different barrier in a different place, uncaught.
+    parser.add_argument('--strike-source', dest='strike_source',
+                        choices=('proxy', 'venue'), default=None,
+                        help="'venue' builds windows from the venue's own "
+                             'floor_strike. The strike and the price series '
+                             'must move together, so use it only on BRTI.')
+    parser.add_argument('--label-source', dest='label_source',
+                        choices=('proxy', 'venue'), default=None,
+                        help="'venue' grades on the venue's own settlement "
+                             'where held, the proxy elsewhere.')
     # Mutually exclusive, at the parser. `--dry-run` used to be declared and
     # never read — `args.dry_run` appeared nowhere in this file — so
     # `--mode live --dry-run --place-orders` parsed cleanly and placed real
@@ -1430,6 +1454,15 @@ def config_from_args(args) -> Config:
     peer = getattr(args, 'require_peer_book', None)
     if peer is not None:
         overrides['require_peer_book'] = bool(peer)
+    venue = getattr(args, 'venue', None)
+    if venue:
+        overrides['venue'] = str(venue)
+    strike = getattr(args, 'strike_source', None)
+    if strike:
+        overrides['strike_source'] = str(strike)
+    label = getattr(args, 'label_source', None)
+    if label:
+        overrides['label_source'] = str(label)
     pinned = getattr(args, 'require_model_version', None)
     if pinned:
         overrides['require_model_version'] = str(pinned)

@@ -223,7 +223,10 @@ def test_the_balance_series_rides_along_for_the_live_end_of_the_chart(client):
 
 def test_the_venue_routes_validate_their_arguments(client):
     assert client.get('/account/venue/equity?days=0').status_code == 422
-    assert client.get('/account/venue/equity?days=400').status_code == 422
+    assert client.get('/account/venue/equity?days=4000').status_code == 422
+    # The chart's own period control offers an `all` setting, so the bound is
+    # the same 3650 the calendar route carries rather than a year.
+    assert client.get('/account/venue/equity?days=3650').status_code == 200
     assert client.get('/venue/settlements?limit=0').status_code == 422
     # `days` is optional on the table routes: the whole ledger is the default.
     assert client.get('/venue/settlements').status_code == 200

@@ -81,7 +81,9 @@ class TestOverlayGating:
     @pytest.mark.asyncio
     async def test_the_default_venue_leaves_spot_untouched(self):
         spot = {'BTC-USD': _spot()}
-        got = await live_bars._overlay_index(DEFAULT_CONFIG, spot, 1500)
+        # Explicit: the default venue IS the index now.
+        spot_cfg = dataclasses.replace(DEFAULT_CONFIG, venue='coinbase_spot')
+        got = await live_bars._overlay_index(spot_cfg, spot, 1500)
         assert got is spot
 
     @pytest.mark.asyncio

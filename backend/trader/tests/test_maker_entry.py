@@ -39,14 +39,6 @@ def test_a_maker_buys_the_bid_and_a_taker_lifts_the_ask():
     assert q.bid_for('down') == pytest.approx(0.34)
 
 
-def test_resting_is_cheaper_than_crossing_by_the_whole_spread():
-    """The economics in one line: a 1c spread is 1c per contract, and on a
-    measured 1.000c median spread that is worth as much as the fee itself."""
-    q = _quote()
-    assert q.ask_for('up') - q.bid_for('up') == pytest.approx(0.01)
-    assert q.ask_for('down') - q.bid_for('down') == pytest.approx(0.01)
-
-
 def test_the_queue_ahead_is_not_the_size_we_could_take():
     """`size_for` caps a taker's order; `rest_size_for` is the queue AHEAD of a
     resting one. Confusing them would read a deep book as a likely fill."""

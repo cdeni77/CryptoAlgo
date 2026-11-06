@@ -53,24 +53,18 @@ def test_the_taker_allowance_is_still_capped_by_max_slippage():
     assert limit == pytest.approx(0.68 + 0.01, abs=1e-9)
 
 
-def test_post_only_is_sent_only_when_resting():
-    """`self_trade_prevention_type` governs SELF matches and cannot keep an
-    order off the public book; post_only is the guarantee."""
-    import inspect
-
-    from data_collection import kalshi_client
-    src = inspect.getsource(kalshi_client.KalshiClient.place_order)
-    assert "'post_only': True} if rest else {}" in src, (
-        'a resting order must be sent post_only')
-
-
 def test_post_only_is_sent_when_resting_and_not_when_crossing():
-    import inspect
+    """Asserted on the BODY the venue receives, not on the source text.
 
-    from data_collection import kalshi_client
-    src = inspect.getsource(kalshi_client.KalshiClient.place_order)
-    assert "**({'post_only': True} if rest else {})" in src, (
-        'post_only must be sent only on a resting order')
+    Two tests used to grep `place_order` for the same expression, so the
+    guarantee that actually reaches the wire had no behavioural coverage at
+    all -- `self_trade_prevention_type`, `time_in_force` and `side` were each
+    pinned on the real body and `post_only` was not.
+    """
+    from tests.test_maker_entry import _sent_body
+
+    assert _sent_body(rest=True)['post_only'] is True
+    assert 'post_only' not in _sent_body(rest=False)
 
 
 def test_a_post_only_refusal_is_an_abstention_not_an_error():

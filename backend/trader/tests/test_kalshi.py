@@ -64,12 +64,6 @@ def test_the_signature_covers_timestamp_method_and_path(key_pem):
     )
 
 
-def test_the_method_is_upper_cased_in_the_signed_message(key_pem):
-    client = KalshiClient(key_id='k', private_key_pem=key_pem)
-    lower = client._headers('post', '/trade-api/v2/portfolio/orders')
-    assert lower['KALSHI-ACCESS-SIGNATURE']  # it signed something
-
-
 def test_placing_an_order_is_refused_unless_the_client_is_live(key_pem):
     """A client not built with `live=True` refuses to place an order."""
     import asyncio

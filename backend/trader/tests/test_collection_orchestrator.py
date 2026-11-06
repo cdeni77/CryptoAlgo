@@ -41,14 +41,6 @@ def test_a_healthy_run_never_trips():
     assert not breaker.tripped
 
 
-def test_empty_results_do_not_trip_the_breaker():
-    """`empty` is an answer, not a failure, so it never trips the breaker."""
-    breaker = Breaker(threshold=0.25, window=40)
-    for _ in range(100):
-        breaker.record(ok=True)  # empty is recorded as ok
-    assert not breaker.tripped
-
-
 def test_a_sustained_outage_trips_the_breaker():
     breaker = Breaker(threshold=0.25, window=40)
     for _ in range(40):

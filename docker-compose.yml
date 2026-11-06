@@ -347,7 +347,7 @@ services:
         --compound
         --bankroll 500
         --max-stake-dollars 40
-        --min-edge-pp 0.5
+        --min-edge-pp 0.1
         --kelly-fraction 0.05
 
   # ===========================================================================
@@ -570,9 +570,52 @@ services:
       - ${TRADER_DATA_MOUNT:-trader_data}:/app/data
       - ${TRADER_MODELS_MOUNT:-trader_models}:/app/models
       - ./backend/trader:/app
+    # **Gate 0.1pp, not 0.5, from 2026-11-05.** Not a tuned value -- a
+    # measurement one. At 0.5 the backtest took 20 trades in 55,764 rows and
+    # there is nothing to estimate from twenty. The edge distribution is
+    # centred at -1.131pp (the toll) with 4.57% of rows positive-EV and only
+    # 1.06% above 0.5, so 1,917 positive-EV rows sat below the old gate.
+    # Read the result as a TEST of whether that tail is real: rows above any
+    # gate are selected for the most extreme estimate, which is where
+    # overconfidence concentrates, and realised edge has come in under
+    # predicted every time it has been measured. The model's typical
+    # disagreement with the mid is 0.370pp against a 1.507pp toll.
+    # **`cross_venue` is OUT, 2026-11-05.** It cost 22% of every row --
+    # `pm_market_probability` was the single largest dropper under
+    # `--complete-cases`, and removing it took coverage from 77.0% to 98.8%
+    # with folds evening out to 1,953-1,992 windows from a 818-1,977 spread.
+    # It bought nothing: fold skill is the same order either way, inside
+    # noise of zero. What it DID buy was disagreement -- the trade rate falls
+    # 1.48% to 0.04% without it -- but that disagreement lost money
+    # (-0.53pp realised over 528 trades). With a 30s cap on a peer sampled
+    # every ~16s, `venue_prob_gap` is substantially 'Kalshi moved in the last
+    # 15-30s', i.e. lagged momentum wearing a cross-venue label. The peer
+    # flags go with it; they existed only to serve this group.
+    # **`implied_vol` is OUT, again.** Dropped from the cron on 2026-10-27 and
+    # reintroduced by a revert. Under `--complete-cases` one NaN drops the
+    # row, and `venue_implied_vol` holds 50,924 fits for BTC, 44,534 for ETH
+    # and 2,047 for SOL -- so nearly every SOL row is discarded and the
+    # evaluated set falls from 12,342 symbol-windows to 5,772, less than
+    # half of what live decides on. The model then trains BTC/ETH-heavy and
+    # trades all three symbols.
+    # **BRTI, not Coinbase, 2026-11-05.** The markets settle on CF Benchmarks
+    # BRTI and price on it, but 35 of 55 features were computed from COINBASE
+    # bars. The basis is white noise at the window scale (sd 0.96bp, 15-minute
+    # autocorrelation +0.094), so it does NOT cancel between the strike and the
+    # decision: ~1.29bp reaches displacement, which at +12m against ~8bp of
+    # remaining sigma is ~6pp of probability error against a 1.5pp target edge.
+    # The strike must move WITH the price series -- `--strike-source venue`
+    # is only valid on BRTI -- so the two flags ship together. Measured
+    # 2026-11-05: Coinbase bars misplace the venue's own settlement on 184
+    # of 6,009 windows (3.1%); BRTI bars on 1.
+    # 30 of 31 promotions ran on coinbase_spot; the single BRTI run
+    # (20261022T171846Z) scored 3.1x better on overconfidence_abs and was the
+    # only one with a positive realised_edge_lcb.
     command: >
       -m scripts.promote
-        --groups cross_venue,geometry,vol_state,microstructure,cross_asset,offset,book_quote,implied_vol
+        --groups geometry,vol_state,microstructure,cross_asset,offset,book_quote
+        --venue cfbenchmarks
+        --strike-source venue
         --start 2026-08-29
         --complete-cases
         --min-train-windows 1200
@@ -580,21 +623,18 @@ services:
         --init-score-source market
         --kelly-fraction 0.10
         --compound
-        --min-edge-pp 0.5
+        --min-edge-pp 0.1
         --bankroll 1000
         --max-entries-per-symbol-window 4
         --max-positions-per-window 12
-        --maker-entry
         --max-stake-dollars 20
         --ensemble-size 5
         --label-source venue
         --edge-lower-bound-z 1.0
         --require-member-agreement
         --quote-sources live_touch,live_ws,live,live_ws_replay
-        --peer-quote-sources all
-        --require-peer-book
         --force
-        --reason "Groups are book_quote, not market_state+book_flow: the 7 depth columns cannot exist before 2026-08-25 because the venue serves no historical order book, and under --complete-cases they pin training to the live era; the 4 quote columns are recoverable to 2025-12-10 from the venue's own candles. Standing operator policy, 2026-10-21: the Sunday retrain ALWAYS installs, so the model keeps absorbing new data. The gates are advisory and the operator reads them; they are not a blocker. Quote sources are Kalshi-only for price VALIDITY rather than measured skill - the Predexon backfill is unbiased but 54x noisier, stamped a minute late, and quantises the deci-cent tail grid to whole cents in ~27% of rows, so a model trained to beat it may not transfer to a book we can trade. It scores worse on the gates and that is accepted. --peer-quote-sources all keeps Polymarket intact: the source filter matches on the bare name and would otherwise discard the gamma backfill, which is a different pipeline, taking every cross_venue row with it."
+        --reason "BRTI end to end: venue bar series, venue strike and venue settlement, so bars, barrier and label are all the series the markets settle on. Coinbase bars misplaced the venue settlement on 184 of 6,009 windows (3.1%) against 1 for BRTI. Taker, not maker: resting saved 0.94pp/contract of fee and cost 1.85pp to adverse selection, and there is no exit path, so a resting order pays a market maker cost and earns none of the revenue. cross_venue and implied_vol are both out under --complete-cases: implied_vol holds 2,047 SOL fits against 50,924 for BTC and discarded nearly every SOL row, and pm_market_probability was the single largest dropper at 46,514 of 79,308 rows; without them coverage is 98.8% and folds even out to 1,953-1,992 windows. cross_venue was the only group producing tradeable disagreement (trade rate 1.48% against 0.04%) but that disagreement lost money (-0.53pp realised over 528 trades), and with a peer sampled every ~16s it is largely lagged momentum. The shipped shrinkage is the WALK-FORWARD median, not the refit own inner-holdout fit: the refit estimates it on ~10% of training windows and returned 0.00001 against a walk-forward 0.96-1.00, which makes the model emit the market price and refuse every trade. Standing operator policy: the Sunday retrain ALWAYS installs so the model keeps absorbing new data; the gates are advisory and the operator reads them."
 
 
 volumes:

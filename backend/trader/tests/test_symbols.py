@@ -15,11 +15,27 @@ from scripts.live import SERIES_BY_SYMBOL
 from scripts.scrape import TIMEFRAME, VENUE_LABEL
 
 
-def test_the_scraper_and_the_reader_use_the_same_venue_label():
-    assert VENUE_LABEL == DEFAULT_CONFIG.venue, (
-        f'the scraper writes venue {VENUE_LABEL!r} and the reader asks for '
-        f'{DEFAULT_CONFIG.venue!r}; every lookup would miss'
+def test_the_reader_asks_for_a_series_something_actually_writes():
+    """`minute_bars` now holds two series, so the labels no longer have to match.
+
+    `scripts.scrape` writes spot under `VENUE_LABEL`; `scripts.backfill_index`
+    writes the settlement index under its own `VENUE`. What must stay true is
+    that whatever the reader asks for is written by SOMETHING -- a reader
+    pointed at a series with no writer misses every lookup, which is how the
+    old single-venue assertion earned its place.
+    """
+    from scripts.backfill_index import VENUE as INDEX_VENUE
+    written = {VENUE_LABEL, INDEX_VENUE}
+    assert DEFAULT_CONFIG.venue in written, (
+        f'the reader asks for {DEFAULT_CONFIG.venue!r} and the writers are '
+        f'{sorted(written)}; every lookup would miss'
     )
+
+
+def test_the_index_series_is_the_default_because_the_markets_settle_on_it():
+    from scripts.backfill_index import VENUE as INDEX_VENUE
+    assert DEFAULT_CONFIG.venue == INDEX_VENUE
+    assert VENUE_LABEL != INDEX_VENUE, 'spot and the index must stay distinguishable'
 
 
 def test_the_scraper_and_the_reader_use_the_same_timeframe_and_dataset():
@@ -50,13 +66,3 @@ def test_every_traded_symbol_maps_to_a_venue_series():
         )
 
 
-def test_a_narrowed_universe_keeps_the_reference():
-    """A universe without the reference symbol is detectable."""
-    narrowed = Config(symbols=('ETH-USD', 'SOL-USD'))
-    assert REFERENCE_SYMBOL not in narrowed.symbols, (
-        'this test asserts the situation is detectable, not that it is allowed'
-    )
-    # `attach_cross_asset` falls back to the mean of the peers, a weaker but defined
-    # result, not a crash.
-    from core.features import attach_cross_asset
-    assert callable(attach_cross_asset)

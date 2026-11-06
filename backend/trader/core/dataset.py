@@ -124,6 +124,7 @@ class Dataset:
         ladder_fits: Optional[pd.DataFrame] = None,
         index_proxy: Optional[pd.DataFrame] = None,
         venue_strikes: Optional[pd.DataFrame] = None,
+        tape: Optional[pd.DataFrame] = None,
     ) -> 'Dataset':
         grids = {s: minute_grid(b) for s, b in bars_by_symbol.items()}
         flat = Seasonality(factor=np.ones(MINUTES_PER_DAY), days_observed=0.0, smoothed_over=0)
@@ -184,6 +185,13 @@ class Dataset:
             windows = attach_index_proxy(
                 windows, index_proxy,
                 max_age_seconds=config.index_proxy_max_age_seconds)
+        # The aggressor extremes while a resting order would have been live, so
+        # the backtest can ask whether it would have FILLED instead of assuming
+        # it. Observed, like the quotes, so it attaches here. Absent tape leaves
+        # the columns NaN and `simulate_fills` then refuses rather than guessing.
+        if tape is not None and len(tape):
+            from core.fills import attach_tape_extremes
+            windows = attach_tape_extremes(windows, tape)
         forward = {s: forward_realised_vol(g, config.window_minutes) for s, g in grids.items()}
         return cls(config=config, grids=grids, states=states, windows=windows,
                    reports=reports, forward_vol=forward)
@@ -277,7 +285,24 @@ def complete_cases(windows: pd.DataFrame,
                        ', '.join(missing))
     if not present or not len(windows):
         return windows.iloc[0:0] if not len(windows) else windows
-    return windows[windows[present].notna().all(axis=1)]
+    keep = windows[present].notna().all(axis=1)
+    # **Say WHICH column did the dropping.** This silently removed 43-72% of
+    # rows, varying by fold, and four separate guesses at the cause (quote
+    # availability, the peer book, depth sizes, implied_vol) each had to be
+    # measured and discarded because nothing reported it. A count per column
+    # turns that into a lookup.
+    if not keep.all():
+        missing_by_column = {
+            c: int(windows[c].isna().sum()) for c in present
+            if windows[c].isna().any()
+        }
+        worst = sorted(missing_by_column.items(), key=lambda kv: -kv[1])[:6]
+        logger.info(
+            'complete_cases kept %d of %d rows (%.1f%%); the columns dropping '
+            'most: %s', int(keep.sum()), len(windows),
+            100.0 * keep.mean(),
+            ', '.join(f'{c}={n:,}' for c, n in worst) or 'none')
+    return windows[keep]
 
 
 def venue_strike_series(frame: Optional[pd.DataFrame]) -> Optional[dict]:

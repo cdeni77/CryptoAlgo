@@ -31,13 +31,22 @@ def test_every_time_series_query_goes_through_the_helper():
 
 
 def test_every_filtering_function_resolves_the_epoch():
+    """Filter with an epoch you resolved, or with one you were handed.
+
+    A helper that takes `epoch` as an argument satisfies this: the caller
+    resolved it. What the guard catches is a function that filters while
+    deciding the scope for itself, or not deciding it at all.
+    """
     tree = ast.parse(SOURCE)
-    lines = SOURCE.split('\n')
+    lines = SOURCE.split(chr(10))
     missing = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name != 'since_reset':
-            body = '\n'.join(lines[node.lineno - 1:node.end_lineno])
-            if 'since_reset(' in body and 'epoch = reset_epoch' not in body:
+            body = chr(10).join(lines[node.lineno - 1:node.end_lineno])
+            takes = [a.arg for a in node.args.args + node.args.kwonlyargs]
+            if ('since_reset(' in body
+                    and 'epoch = reset_epoch' not in body
+                    and 'epoch' not in takes):
                 missing.append(node.name)
     assert not missing, f'uses since_reset without an epoch: {missing}'
 
@@ -115,20 +124,24 @@ def test_every_epoch_scoped_endpoint_forwards_all_time():
     assert not dropped, f'routes that drop all_time: {dropped}'
 
 
-def test_all_time_calendar_is_measured_on_settlements():
-    """Account value counts deposits as profit, so all time cannot use it.
+def test_the_calendar_is_measured_on_settlements_in_both_scopes():
+    """Account value is not this strategy's result on a shared account.
 
-    The epoch window has no transfer in it and reconciles against the Kalshi
-    app, so it keeps the account-value basis. The full ledger does have
-    transfers -- a shared account -- and summing account value over it reported
-    $347.98 for an account that had made $42.85.
+    It counts whatever else the account holds: one day's balance moved -$25.64
+    while the crypto markets settled -$134.10, the difference being a +$90.09
+    position in another series. Across the ledger those series come to -$2,128
+    and the deposits to $3,146. Both scopes therefore read `venue_settlements`,
+    which holds the crypto series alone.
+
+    Asserted on the source, because the query this guards against is
+    Postgres-only and the SQLite harness cannot run it to find out.
     """
     tree = ast.parse(SOURCE)
     lines = SOURCE.split('\n')
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == 'venue_daily_pnl')
     body = '\n'.join(lines[fn.lineno - 1:fn.end_lineno])
-    assert "day['cash_change'] = None" in body, (
-        'all time must drop the account-value column')
-    assert "'basis': 'settled' if all_time else 'account_value'" in body, (
-        'the payload must say which measure it carries')
+    assert 'VenueBalance' not in body, (
+        'the day cells must not be measured on the account balance')
+    assert 'cash_change' not in body, (
+        'the account-value column is gone; one measure, one label')

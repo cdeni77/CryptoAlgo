@@ -97,6 +97,11 @@ class ForecastModel:
     # Without them the artifact can be evaluated but not deployed.
     scoring: Any = None
     residual_scale: float = 1.0
+    # What the REFIT's own inner holdout said, when the shipped
+    # `residual_scale` came from the walk-forward instead. Kept because the
+    # two disagreed by five orders of magnitude on every 2026-11-05 run and
+    # a number that only ever reached a log line cannot be audited later.
+    refit_residual_scale: Optional[float] = None
     groups: tuple[str, ...] = ()
     n_train_rows: int = 0
     n_train_windows: int = 0
@@ -134,6 +139,19 @@ class ForecastModel:
     @property
     def ensemble_size(self) -> int:
         return len(self.boosters)
+
+    @property
+    def member_trees(self) -> tuple[int, ...]:
+        """Trees kept by EACH ensemble member.
+
+        `best_iteration` is `members[0]`'s alone. Reporting one member of five
+        as "the" tree count can call an ensemble degenerate when four members
+        trained fine, or hide it when they did not. Early stopping judges every
+        member against the SAME inner block, so they tend to stop together --
+        which is the point: the ensemble does not average that decision away.
+        """
+        return tuple(int(getattr(b, 'best_iteration', 0) or 0)
+                     for b in self.boosters)
 
     def member_corrections(self, table: pd.DataFrame) -> np.ndarray:
         """Each member's raw logit correction, shape (members, rows)."""
@@ -233,6 +251,7 @@ class ForecastModel:
             'empty_features': list(self.empty_features),
             'groups': list(self.groups),
             'residual_scale': self.residual_scale,
+            'refit_residual_scale': getattr(self, 'refit_residual_scale', None),
             'init_coefficient': float(getattr(self, 'init_coefficient', 1.0)),
             'intercept': float(getattr(self, 'intercept', 0.0)),
             'ensemble_size': self.ensemble_size,
@@ -335,7 +354,17 @@ class ForecastModel:
         # differ legitimately between the fitting run and the scoring run.
         material = ('window_minutes', 'decision_offsets', 'vol_lookbacks_minutes',
                     'embargo_minutes', 'fee_rate', 'maker_fee_multiplier', 'assume_maker',
-                    'half_spread_cents', 'min_traded_price', 'max_traded_price')
+                    'half_spread_cents', 'min_traded_price', 'max_traded_price',
+                    # `venue` picks the bar series every price-derived feature is
+                    # built from. Absent here, a BRTI-fitted artifact scored on
+                    # Coinbase bars passed silently -- 35 of 55 features computed
+                    # on a basis they were never fitted on, with no error.
+                    'venue',
+                    # `strike_source` moves the BARRIER itself and
+                    # `label_source` moves what counts as a win. A model
+                    # fitted on the venue's strike and served on the proxy
+                    # is predicting a different event.
+                    'strike_source', 'label_source')
         drift = {
             key: (stored.get(key), current.get(key))
             for key in material

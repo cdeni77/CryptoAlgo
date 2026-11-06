@@ -15,13 +15,13 @@ collection. There is no fourth state where something plausible is invented.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import math
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from models.serving import (
@@ -36,9 +36,23 @@ from models.serving import (
 # previous perp system that single number said what no Sharpe ratio said.
 FUNNEL_ORDER = (
     'traded', 'not_finite', 'probability_invalid', 'no_quote', 'no_peer_book',
+    # A feature the artifact was fitted on is cold, so the row abstains
+    # rather than scoring a LightGBM default in its place.
+    'features_unavailable',
     'price_out_of_band', 'disagreement_implausible', 'edge_below_gate',
     'edge_uncertain', 'members_disagree', 'below_min_contracts',
-    'fee_ceiling', 'window_exposure', 'position_limit', 'already_entered',
+    # Simulated fills: the order cleared every gate and nobody crossed to it.
+    # It sits beside the other execution outcomes because that is what it is --
+    # the decision was sound and the venue did not hand it over.
+    'no_fill',
+    'fee_ceiling', 'window_exposure',
+    # Kelly sizes the (symbol, window) BARRIER, not the order: offsets
+    # 3/6/9/12 buy one barrier and settle on one outcome, so a later offset
+    # tops up to the target instead of staking afresh. One already at or above
+    # its target is refused here -- there is no exit path, so an over-funded
+    # barrier is left alone rather than sold down.
+    'barrier_funded',
+    'position_limit', 'already_entered',
     # The window is held on the OTHER side. Distinct from `already_entered`,
     # which means the entries are used up: this one means the model changed
     # its mind, and buying the opposite side nets against the open position
@@ -939,6 +953,66 @@ def venue_settlements(db: Session, *, days: Optional[int] = None,
 EASTERN = 'America/New_York'
 
 
+#: How stale a balance sample may be and still count as the mark AT a boundary.
+#: `mark_positions` writes one a second, so a gap this size means the sampler
+#: was down, not that the book was quiet. A stale sample is reported as no mark
+#: rather than as a mark, because the second is a measurement and the first is
+#: a guess about one.
+_MARK_TOLERANCE = timedelta(minutes=15)
+
+
+def _boundary_carry(db: Session, at: datetime,
+                    epoch) -> tuple[Optional[float], bool]:
+    """Unrealised P&L on the open crypto book at `at`: the venue's mark, less cost.
+
+    Returns `(carry, foreign)`. `carry` is None when no mark was recorded close
+    enough to the instant to be one. `foreign` is True when the mark is larger
+    than the open crypto book could possibly be worth, which means it also
+    holds a position in a series this system does not trade.
+
+    A binary pays at most $1 a contract, so `contracts` is a hard ceiling on
+    what the venue can be marking our book at. This account is shared, and
+    without that check another market's open position would be carried into a
+    day as if the strategy had earned it.
+    """
+    sample = db.execute(
+        since_reset(select(VenueBalance), VenueBalance, epoch)
+        .where(VenueBalance.timestamp <= at,
+               VenueBalance.portfolio_value.is_not(None))
+        .order_by(VenueBalance.timestamp.desc()).limit(1)
+    ).scalars().first()
+    if sample is None:
+        return None, False
+    # SQLite hands back a naive datetime where Postgres hands back an aware
+    # one. The column is UTC either way.
+    taken = sample.timestamp
+    if taken.tzinfo is None:
+        taken = taken.replace(tzinfo=timezone.utc)
+    if at - taken > _MARK_TOLERANCE:
+        return None, False
+
+    # **Measured at the SAMPLE's instant, not at the boundary.** The mark is
+    # whatever the venue held when it was taken; a position entered between
+    # that moment and the boundary is not inside it, and counting its cost
+    # against that mark reports the entry as an instant loss. The windows open
+    # on the quarter hour, so midnight is exactly such a moment -- six
+    # positions were being added to a mark taken one second earlier.
+    held = db.execute(
+        since_reset(select(Position), Position, epoch)
+        .where(Position.window_open <= taken)
+        .where((Position.settled_at.is_(None)) | (Position.settled_at > taken))
+    ).scalars().all()
+    cost = sum(float(p.outlay or 0.0) + float(p.fee or 0.0) for p in held)
+    contracts = sum(float(p.contracts or 0) for p in held)
+
+    mark = float(sample.portfolio_value)
+    # A cent of slack, so whole-dollar rounding in the venue's own mark does
+    # not read as a foreign position.
+    if mark > contracts + 0.01:
+        return None, True
+    return round(mark - cost, 4), False
+
+
 def venue_daily_pnl(db: Session, *, days: int = 120,
                     all_time: bool = False) -> dict[str, Any]:
     """Realised P&L per EASTERN calendar day, from the venue's own settlements.
@@ -952,7 +1026,9 @@ def venue_daily_pnl(db: Session, *, days: int = 120,
 
     `all_time` lifts it, for the page that reports the account rather than the
     current configuration. The scope is the caller's to choose, and `epoch` in
-    the payload says which one was served.
+    the payload says which one was served. It changes which days are in range
+    and nothing else -- both scopes carry the same measure, so a day reads the
+    same under either heading.
 
     Days with no settlement are omitted rather than sent as zero -- a day the
     system did not trade is not a break-even day, and drawing it flat would put
@@ -998,213 +1074,102 @@ def venue_daily_pnl(db: Session, *, days: int = 120,
         elif verdict is False:
             day['losses'] += 1
 
-    # **A day is the change in ACCOUNT VALUE across it, and nothing else.**
+    # **A day is what the crypto markets settled on it, and nothing else.**
     #
-    # This was built three times the hard way and each attempt failed the same
-    # reader test. First as realised P&L on markets that settled in the day,
-    # which disagreed with the Kalshi app. Then as the cash change, which sawed
-    # up and down as the trader opened and closed windows. Then as cash plus a
-    # reconstruction of what was held at each boundary -- which produced a
-    # correction nobody could read, because a single net number covering two
-    # different midnights does not mean anything you can say in a sentence.
+    # Not the change in account value. That equals this strategy's result only
+    # while the account holds nothing else, and this account is shared: the
+    # operator places bets by hand in other series, and it takes deposits. Both
+    # move the balance and neither is the strategy. The identity is
     #
-    # Account value is `cash + what the open book is worth`, and the venue
-    # serves both on `/portfolio/balance` -- the second as `portfolio_value`,
-    # its OWN mark. Sampled every second by `scripts/mark_positions.py`,
-    # because Kalshi has no history endpoint of any kind (probed exhaustively
-    # 2026-10-20: summary, pnl, history, balance_history, statements, ledger
-    # are all 404). A day's P&L is then the last sample of the day minus the
-    # last sample of the day before. No boundary correction exists, because a
-    # window open at midnight is simply inside both measurements.
+    #   d(account value) = crypto settled + other series + deposits + carry
     #
-    # Fees, settlement, netting and the whole fee schedule are already in those
-    # two numbers. Nothing here models any of them.
+    # and the first term is the only one that belongs here.
     #
-    # Deposits and withdrawals would corrupt this, being cash that is not
-    # strategy -- `incomplete` carries the warning and the dashboard says so.
-    # None have landed inside any sampled day on this account.
+    # `venue_settlements` holds the three crypto series alone, and its per-day
+    # totals agree with the venue's own `/portfolio/positions` ledger to the
+    # cent. Fees are inside `pnl`. Nothing here models a fee schedule, a payout
+    # or a netting rule; all three are the venue's.
     #
-    # **One row per day, selected in the database.** The sampler writes a row a
-    # second -- 86,400 a day -- so loading the range into Python and keeping
-    # the last of each day, which is what this did first, would pull millions
-    # of rows to compute a few dozen numbers. `DISTINCT ON` does the same work
-    # at the index. The bucketing is `AT TIME ZONE` in Postgres so the day
-    # boundary is the same one the settlement buckets above use; computing it
-    # in two places in two languages is how they drift apart.
-    eastern = ZoneInfo(EASTERN)
-    closes = db.execute(text('''
-        SELECT DISTINCT ON (day) day, timestamp, balance, total_balance, portfolio_value,
-               first_value(balance)         OVER w AS open_balance,
-               first_value(total_balance)   OVER w AS open_total,
-               first_value(portfolio_value) OVER w AS open_portfolio
-        FROM (
-            SELECT (timestamp AT TIME ZONE :tz)::date AS day,
-                   timestamp, balance, total_balance, portfolio_value
-            FROM venue_balance
-            WHERE timestamp >= :since AND timestamp >= :epoch
-        ) rows
-        WINDOW w AS (PARTITION BY day ORDER BY timestamp
-                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
-        ORDER BY day, timestamp DESC
-    '''), {'tz': EASTERN, 'since': since,
-           # No epoch means the whole ledger, expressed as a floor nothing is
-           # below rather than as a NULL branch -- `:epoch::timestamptz` reads
-           # as a bind parameter to SQLAlchemy and will not parse.
-           'epoch': epoch or datetime(1970, 1, 1, tzinfo=timezone.utc)},
-    ).mappings().all()
-
-    close_value: dict[str, float] = {}
-    #: Only used for the FIRST day in range, which has no previous close.
-    open_value: dict[str, float] = {}
-    closed_at: dict[str, Any] = {}
-    _mark_only: dict[str, float] = {}
-    ordered_days: list[str] = []
-    marked_days: set[str] = set()
-    for row in closes:
-        # **The trading shard, consistently -- NOT the cross-shard total.**
-        # Preferring the total and falling back to the shard mixed two bases
-        # within one subtraction: 2026-10-18 opened on a row with
-        # `total_balance` NULL (472.28, the shard) and closed on one that had
-        # it (486.81, the total), inventing the $1.11 that permanently sits on
-        # the other shards. These are DIFFERENCES, and the stranded cash does
-        # not move, so the shard gives the same answer with no NULLs in it.
-        cash = row['balance']
-        if cash is None:
-            continue
-        # **Null is not zero here.** Rows written before the sampler existed
-        # carry no mark, and treating that as a flat book would report every
-        # open position at a day's end as a total loss and then as a windfall
-        # the next morning. Those days are measured on cash alone and flagged.
-        mark = row['portfolio_value']
-        key = row['day'].isoformat()
-        ordered_days.append(key)
-        closed_at[key] = row['timestamp']
-        close_value[key] = float(cash) + (0.0 if mark is None else float(mark))
-        open_cash = (row['open_total'] if row['open_total'] is not None
-                     else row['open_balance'])
-        if open_cash is not None:
-            open_value[key] = float(open_cash) + (
-                0.0 if row['open_portfolio'] is None
-                else float(row['open_portfolio']))
-        if mark is not None:
-            marked_days.add(key)
-            _mark_only[key] = float(mark)
-    ordered_days.sort()
-    newest = ordered_days[-1] if ordered_days else None
-    first_day = ordered_days[0] if ordered_days else None
-
-    def day_change(key: str) -> Optional[float]:
-        """Close minus the previous day's close."""
-        if key not in close_value:
-            return None
-        position = ordered_days.index(key)
-        if position == 0:
-            # **The first day in range falls back to its settled P&L.**
-            #
-            # Differencing it against its own first sample was tried and is
-            # worse: the epoch lands mid-day AND mid-trade -- measured, three
-            # positions costing $5.56 were already open at 2026-10-18 12:33 --
-            # so that day's opening sample is a balance with their cost
-            # already deducted and nothing recorded for what they were worth.
-            # The day then reported a gain it had not made.
-            #
-            # Settled P&L is the honest answer for a day whose opening
-            # position is unknown, and `partial` says it is not comparable
-            # with the days around it.
-            return None
-        return round(close_value[key] - close_value[ordered_days[position - 1]], 4)
-
+    # The cost of this choice: a window bought before midnight settles after
+    # it, so a day here is not the day the cash moved and will not tie to the
+    # Kalshi app, which totals the whole account. The calendar says so.
+    # **A day is its settlements plus what crossed its midnights.**
+    #
+    # The venue marks an open position to market, so a window bought before
+    # midnight has already shown part of its result by the time it settles the
+    # next day. Settled P&L books the whole thing on the settlement day. The
+    # two differ by exactly the unrealised carried over the boundary:
+    #
+    #   day = settled + carry(close) - carry(open)
+    #
+    # and both carries are `the venue's own mark - what the open book cost`.
+    # Measured on a flat book: $35.32 settled against the venue's own $24.43,
+    # with three positions costing $40.05 marked at $50.94 the night before.
+    #
+    # This keeps the measure crypto-only -- the account is shared, and account
+    # value would count another series and every deposit -- while agreeing with
+    # the venue day by day. `pnl` stays the settled primitive beside it, so the
+    # adjustment is never the only figure on the row.
     days_out = [buckets[k] for k in sorted(buckets)]
+    newest = days_out[-1]['date'] if days_out else None
+    now = datetime.now(timezone.utc)
+    eastern = ZoneInfo(EASTERN)
+    carries: dict[datetime, tuple[Optional[float], bool]] = {}
+
+    def carry_at(moment: datetime) -> tuple[Optional[float], bool]:
+        if moment not in carries:
+            carries[moment] = _boundary_carry(db, moment, epoch)
+        return carries[moment]
+
     for day in days_out:
-        day['cash_change'] = day_change(day['date'])
-        # Retained as a field so the payload shape does not change under the
-        # frontend, but there is no boundary correction any more: the account
-        # value already contains whatever was open at each end.
-        day['open_value'] = 0.0
-        # Partial when the day is still running, or when it is the first day in
-        # range and has no previous close to difference against.
-        day['partial'] = day['date'] in (newest, first_day)
-        # Measured on cash alone, because no mark was recorded that day. Worth
-        # saying: it is right only if the book was flat at the boundary.
-        day['unmarked'] = day['date'] not in marked_days
+        # The day is still running, so more can still settle into it.
+        day['partial'] = day['date'] == newest
         day['pp_per_contract'] = (
             round(day['pnl'] / day['contracts'] * 100.0, 3)
             if day['contracts'] else None)
         day['pnl'] = round(day['pnl'], 4)
         day['fees'] = round(day['fees'], 4)
 
-    # **The first day also gets credited with whatever it ended still holding.**
-    #
-    # It is measured as settled P&L, which counts nothing for a position that
-    # had not resolved by midnight. The NEXT day is measured as a change in
-    # account value, and its opening value does include that position -- so
-    # the open book at that one boundary was being subtracted from day two
-    # without ever having been added to day one. Measured 2026-10-20: $0.32,
-    # showing up as +$0.53 on 10-19 and -$0.21 on 10-20, and leaving the
-    # headline 32c above the settled total on a completely flat book.
-    #
-    # Adding the closing unrealised to the first day cancels it exactly.
-    if days_out and ordered_days:
-        boundary = ordered_days[0]
-        at = closed_at.get(boundary)
-        first = next((d for d in days_out if d['date'] == boundary), None)
-        if first is not None and at is not None and boundary in marked_days:
-            held = db.execute(
-                since_reset(select(Position), Position, epoch)
-                .where(Position.window_open <= at)
-                .where((Position.settled_at.is_(None))
-                       | (Position.settled_at > at))
-            ).scalars().all()
-            cost = sum(float(p.outlay or 0.0) + float(p.fee or 0.0) for p in held)
-            # What the open book was worth at that midnight, minus what it
-            # cost to put on: the unrealised P&L carried into the next day.
-            carried = round(_mark_only.get(boundary, 0.0) - cost, 4)
-            first['carried_open'] = carried
-            if first['cash_change'] is None:
-                first['cash_change'] = round(first['pnl'] + carried, 4)
-
-    # **All time is measured on SETTLEMENTS, not on account value.**
-    #
-    # Account value is the better measure over the epoch window, because it
-    # reconciles against the Kalshi app and already contains fees, netting and
-    # whatever was open at each boundary. It is only valid while no cash enters
-    # or leaves, and over the full ledger cash did: measured 2026-10-22, four
-    # days carry a transfer the strategy did not earn -- +$301.84 on 09-24,
-    # -$96.86 on 09-26, +$116.57 on 09-27, -$12.39 on 10-04. Summing the
-    # account-value column over all time reports $347.98 for an account that
-    # made $42.85, which is the deposits, not the trading.
-    #
-    # The sampler also starts on 2026-09-22, so 29 of the 57 all-time days have
-    # no account value at all and already fall back to settlements. One column
-    # under one total must not hold two bases. Settlements cover the whole
-    # range, cannot contain a transfer, and agree with the headline.
-    if all_time:
-        for day in days_out:
-            day['cash_change'] = None
-
-    # The sum of exactly what the cells show, so the header can never disagree
-    # with the squares underneath it.
-    shown_total = round(sum(
-        (d['cash_change'] if d['cash_change'] is not None else d['pnl'])
-        for d in days_out), 4)
+        stamp = date.fromisoformat(day['date'])
+        opened = datetime.combine(stamp, time(0, 0),
+                                  tzinfo=eastern).astimezone(timezone.utc)
+        # A day still running is marked AT NOW, not at a midnight that has not
+        # happened: that is what makes today's cell the figure the venue shows
+        # for today rather than a number waiting for the day to end.
+        closed = min(datetime.combine(stamp + timedelta(days=1), time(0, 0),
+                                      tzinfo=eastern).astimezone(timezone.utc),
+                     now)
+        carried_in, foreign_in = carry_at(opened)
+        carried_out, foreign_out = carry_at(closed)
+        day['carried_in'] = carried_in
+        day['carried_out'] = carried_out
+        day['foreign_mark'] = foreign_in or foreign_out
+        day['pnl_marked'] = (
+            None if carried_in is None or carried_out is None
+            else round(day['pnl'] + carried_out - carried_in, 4))
 
     return {
         'timezone': EASTERN,
         # So the surface can say what it is showing rather than imply it is
         # everything. Null when no reset is set, which means the full ledger.
         'epoch': epoch.isoformat() if epoch is not None else None,
-        # Which measure the cells carry, said rather than inferred from
-        # whether `cash_change` happens to be null.
-        'basis': 'settled' if all_time else 'account_value',
         'days': days_out,
         'first': days_out[0]['date'] if days_out else None,
         'last': days_out[-1]['date'] if days_out else None,
-        # The SHOWN total -- the sum of the cells. `settled_total` is the old
-        # quantity (realised P&L on markets that resolved), kept because the
-        # promotion gates and the research surface still speak in it.
-        'total': shown_total,
+        # The sum of exactly what the cells show, so the header can never
+        # disagree with the squares underneath it.
+        'total': round(sum(_shown(d) for d in days_out), 4),
+        # The settled primitive on its own, which the gates and the research
+        # surface speak in. It differs from `total` by the carry at the two
+        # ends of the range and by nothing else.
         'settled_total': round(sum(d['pnl'] for d in days_out), 4),
     }
+
+
+def _shown(day: dict[str, Any]) -> float:
+    """What the cell carries: the marked figure, or settled where there is no mark."""
+    marked = day.get('pnl_marked')
+    return day['pnl'] if marked is None else marked
 
 
 def venue_account_state(db: Session, *,
@@ -1404,8 +1369,12 @@ def venue_equity_curve(db: Session, *, days: int = 30,
         epoch = None
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
+    # **Epoch-scoped like the window itself.** It is what the caption adds back
+    # to put the series on a lifetime scale, so a figure from before the reset
+    # would carry P&L the rest of the page is not showing.
     earlier = db.execute(
-        select(func.sum(VenueSettlement.pnl))
+        since_reset(select(func.sum(VenueSettlement.pnl)),
+                    VenueSettlement, epoch)
         .where(VenueSettlement.settled_time < since,
                VenueSettlement.pnl.is_not(None))
     ).scalar()

@@ -185,6 +185,13 @@ def resolve_max_deviation(per_fold, pooled) -> tuple:
                           'minimum row count, in any fold or pooled')
 
 
+#: Below this a fold's model is effectively a constant: with `learning_rate`
+#: 0.03 and 15 leaves, one or two trees move the forecast a fraction of a
+#: percentage point, under any usable edge gate. Such a fold takes zero trades
+#: for a reason that has nothing to do with the market.
+MIN_USEFUL_TREES = 2
+
+
 @dataclass
 class FoldEvaluation:
     """One fold's out-of-sample measurement."""
@@ -211,6 +218,12 @@ class FoldEvaluation:
     # The worst deviation in any adequately-populated reliability bin. Mean ECE
     # cannot see the traded band; this can.
     model_max_deviation: float = float('nan')
+    # **Trees this fold's model actually kept.** Printed because its absence hid
+    # a four-layer error: early stopping decides on a block whose log-loss noise
+    # is ~600x the effect, so counts swing 1 to 167 across adjacent weeks. A
+    # fold at 1-2 trees ships a near-constant correction, cannot disagree with
+    # the market, takes zero trades, and reads as "no edge in this week".
+    n_trees: Optional[tuple] = None
 
     @property
     def skill(self) -> float:
@@ -226,10 +239,22 @@ class FoldEvaluation:
         if self.stats is not None:
             money = (f' | {self.stats.n_trades:,} trades '
                      f'{self.stats.total_return:+.2%} Sharpe {self.stats.sharpe:+.2f}')
+        trees = ''
+        counts = tuple(self.n_trees or ())
+        if counts:
+            # Every MEMBER's count, because `best_iteration` is member 0's
+            # alone. The ensemble is degenerate only when the MEDIAN member is,
+            # and the spread shows whether the members agreed -- they share one
+            # inner block, so they usually do.
+            mid = int(np.median(counts))
+            span = (f'{min(counts)}-{max(counts)}' if min(counts) != max(counts)
+                    else f'{counts[0]}')
+            flag = '  <- DEGENERATE FIT' if mid <= MIN_USEFUL_TREES else ''
+            trees = f'  trees {span}{flag}'
         return (f'  fold {self.index} [{self.test_start:%Y-%m-%d}..{self.test_end:%Y-%m-%d}] '
                 f'{self.n_windows:,}w  skill {self.skill:+.5f}  '
                 f'ECE {self.model_ece:.4f} (base {self.baseline_ece:.4f})  '
-                f'alpha {self.residual_scale:.3f}{money}')
+                f'alpha {self.residual_scale:.3f}{trees}{money}')
 
 
 def evaluate_fold(
@@ -241,6 +266,7 @@ def evaluate_fold(
     residual_scale: float,
     control_gain_share: float,
     stats: Optional[BookStats] = None,
+    n_trees: Optional[int] = None,
 ) -> FoldEvaluation:
     from core.cv import effective_observations
 
@@ -293,6 +319,7 @@ def evaluate_fold(
         reliability_table=model_reliability,
         n_non_finite=n_non_finite,
         model_max_deviation=model_reliability.worst_deviation(),
+        n_trees=n_trees,
         stats=stats, per_offset=per_offset,
     )
 
@@ -571,6 +598,12 @@ class EvaluationReport:
             'median_fold_drawdown': self.median_fold_drawdown,
             'worst_fold_drawdown': self.worst_fold_drawdown,
             'halted': 1.0 if (continuous and continuous.halted) else 0.0,
+            # **How often, not just whether.** With a resume configured the
+            # book trades the whole range and halts repeatedly; one halt in 293
+            # days and one a week are different strategies, and `halted` cannot
+            # tell them apart. Reported beside it rather than replacing it --
+            # `halted` is a frozen gate and changing it is a gate-spec change.
+            'n_halts': float(continuous.n_halts) if continuous else 0.0,
         }
 
     def summary(self) -> str:

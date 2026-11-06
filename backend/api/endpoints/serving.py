@@ -55,7 +55,7 @@ def get_venue_account(all_time: bool = Query(False),
 
 
 @router.get('/account/venue/equity')
-def get_venue_equity(days: int = Query(30, ge=1, le=365),
+def get_venue_equity(days: int = Query(30, ge=1, le=3650),
                      all_time: bool = Query(False),
                      db: Session = Depends(get_db)):
     """The account chart: realised P&L per settlement, venue cash beside it.

@@ -180,6 +180,19 @@ async def run(args) -> int:
     sem = asyncio.Semaphore(max(1, args.concurrency))
     written = batch = 0
     rows: list[dict] = []
+    # **No credentials must fail loudly.** Run in a service without a Kalshi
+    # key, every request fails instantly and the run reports
+    # "1185/1185 asked, 0 row(s) written" -- an auth failure presented as a fact
+    # about the venue. That happened on 2026-11-05 in the `retrain` service,
+    # which carries no key, and the same 1,185 requests returned 1,395 rows from
+    # the `trader` service seconds later.
+    if not (os.getenv('KALSHI_KEY_ID') and
+            (os.getenv('KALSHI_PRIVATE_KEY') or os.getenv('KALSHI_PRIVATE_KEY_PATH'))):
+        raise SystemExit(
+            'no Kalshi credentials (KALSHI_KEY_ID plus KALSHI_PRIVATE_KEY or '
+            '_PATH). Every request would fail and be reported as zero rows, '
+            'which reads as "the venue has no data" rather than "this service '
+            'cannot ask". Run it where the key is, e.g. the `trader` service.')
     async with KalshiClient(live=False) as client:
         for i in range(0, len(jobs), args.batch):
             chunk = jobs[i:i + args.batch]

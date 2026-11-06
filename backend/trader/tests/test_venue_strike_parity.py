@@ -21,13 +21,6 @@ def test_live_does_not_assign_strike_or_displacement_into_the_scored_frame():
             f'build_features has produced it')
 
 
-def test_the_identity_abs_z_equals_abs_of_z_is_preserved():
-    """`abs_z_score == |z_score|` holds in every training row, so it must hold live too."""
-    frame = pd.DataFrame({'z_score': [0.8, -1.4, 0.0],
-                          'abs_z_score': [0.8, 1.4, 0.0]})
-    assert np.allclose(frame['abs_z_score'], frame['z_score'].abs())
-
-
 def test_the_venue_strike_is_still_observed_just_not_fed_to_the_model():
     """The venue strike is still recorded (`venue_strike`, `strike_source`), just not
     fed to the model.

@@ -65,9 +65,3 @@ def test_the_trading_loops_own_touch_names_its_observer():
     assert "'source': 'live_touch'" in source
 
 
-def test_the_three_observers_are_distinct(tmp_path):
-    """live (REST poll), live_ws (stream) and live_touch (trading loop) are distinct sources."""
-    from core.datastore import event_key
-    assert 'source' in event_key('venue_depth')
-    names = {'live', 'live_ws', 'live_touch'}
-    assert len(names) == 3, 'each observer must have its own name or one is lost'

@@ -44,6 +44,11 @@ DECISION_FIELDS = (
     'max_positions_per_window', 'max_entries_per_symbol_window',
     'max_window_exposure_fraction',
     'max_stake_dollars',
+    # Live refuses a decision whose cross-venue peer book is missing; the
+    # retrain did not, and nothing caught it because this field was in neither
+    # list. `--complete-cases` demands the peer in training, so a retrain
+    # without it grades rows the account would never take.
+    'require_peer_book',
 )
 
 # Policy the LIVE loop inherits from the installed artifact's provenance rather

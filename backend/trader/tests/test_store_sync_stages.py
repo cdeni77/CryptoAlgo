@@ -23,5 +23,8 @@ def test_every_stage_the_training_set_needs_is_run():
 
 def test_a_failing_stage_does_not_stop_the_others():
     source = inspect.getsource(run_live.store_sync_loop)
-    assert 'continue' in source or 'returncode' in source, (
-        'the loop must survive one stage failing')
+    # **Both, not either.** `scripts/run_live.py` contains each independently
+    # -- `continue` in the timeout handler, `returncode` in the exit check --
+    # so the disjunction could not go red for any single deletion.
+    assert 'continue' in source, 'the loop must resume after a stage times out'
+    assert 'returncode' in source, 'a stage exit code must be inspected'

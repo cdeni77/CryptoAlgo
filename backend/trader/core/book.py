@@ -96,6 +96,17 @@ class Book:
     refusals: list[Decision] = field(default_factory=list)
     equity_points: list[tuple[pd.Timestamp, float]] = field(default_factory=list)
     halted_at: Optional[pd.Timestamp] = None
+    #: WHICH breaker latched. Four can, and naming the wrong one sends the
+    #: reader to inspect a limit that was never approached.
+    halted_reason: Optional[str] = None
+    #: Every halt, not just the first: `(when, why)`. One halt in 293 days and
+    #: one a week are different strategies, and `halted` alone cannot tell them
+    #: apart.
+    halt_events: list[tuple[pd.Timestamp, str]] = field(default_factory=list)
+    #: Settlements before this instant are forgiven by the consecutive-loss
+    #: breaker. Clearing a halt without it leaves the streak that caused the
+    #: halt in place, so the next loss re-trips it for ever.
+    streak_from: Optional[pd.Timestamp] = None
     # Refusals that `core.decide.stateless_screen` handled vectorised, so the
     # rejection histogram is complete.
     stateless_rejections: pd.Series = field(default_factory=lambda: pd.Series(dtype=int))
@@ -146,12 +157,31 @@ class Book:
         self.open_positions = remaining
         # Latch on the same halts as `scripts/live.py`: ruin floor, drawdown,
         # consecutive losses and daily loss. The gates must measure the policy live runs.
-        if self.halted_at is None and settled:
+        if not self.is_halted(at) and settled:
             reason = self._halt_reason(settled)
             if reason is not None:
                 self.halted_at = settled[-1].position.settle_time
+                self.halted_reason = reason
+                self.halt_events.append((self.halted_at, reason))
+                # The streak that caused this halt is spent. A resume that did
+                # not forgive it would re-trip on the next single loss.
+                self.streak_from = self.halted_at
                 logger.warning('halted at %s — %s', self.halted_at, reason)
         return settled
+
+    def is_halted(self, at: Optional[pd.Timestamp] = None) -> bool:
+        """Is trading stopped at `at`?
+
+        Latched for ever unless `halt_resume_hours` is set, which simulates the
+        operator who clears a live halt by hand. `at` is the instant being
+        decided; without one the answer is simply whether a halt was ever hit.
+        """
+        if self.halted_at is None:
+            return False
+        hours = getattr(self.config, 'halt_resume_hours', None)
+        if not hours or at is None:
+            return True
+        return pd.Timestamp(at) < self.halted_at + pd.Timedelta(hours=float(hours))
 
     def _halt_reason(self, settled) -> Optional[str]:
         """Why trading should stop, or None. Mirrors `scripts/live.py`."""
@@ -172,6 +202,11 @@ class Book:
 
         run = 0
         for record in reversed(self.settlements):
+            # Everything at or before the last halt is forgiven: an operator
+            # clearing a halt accepts the streak that caused it.
+            if (self.streak_from is not None
+                    and record.position.settle_time <= self.streak_from):
+                break
             if record.pnl >= 0:
                 break
             run += 1
@@ -251,6 +286,10 @@ class BookStats:
     # The per-trade Sharpe, kept for comparison with historical reports.
     # `sharpe` is the account's.
     sharpe_per_trade: float = float('nan')
+    #: Which breaker latched, as `Book._halt_reason` worded it.
+    halted_reason: Optional[str] = None
+    #: How many times trading stopped. 1 and 9 are different strategies.
+    n_halts: int = 0
 
     @property
     def growth_multiple(self) -> float:
@@ -272,7 +311,10 @@ class BookStats:
             f'realised {self.realised_edge_pp:+.2f}pp | fees ${self.total_fees:.2f}\n'
             f'  Sharpe {self.sharpe:+.2f} on {self.trades_per_year:,.0f} trades/yr | '
             f'maxDD {self.max_drawdown:.2%}'
-            + ('  | HALTED at the bankroll floor' if self.halted else '')
+            + ('  | HALTED'
+               + (f' {self.n_halts}x' if self.n_halts > 1 else '')
+               + ': ' + (self.halted_reason or 'reason not recorded')
+               if self.halted else '')
         )
 
 
@@ -296,6 +338,8 @@ def summarise(book: Book, *, windows_available: int) -> BookStats:
             mean_return_on_stake=float('nan'), sd_return_on_stake=float('nan'),
             trades_per_year=0.0, sharpe=float('nan'), max_drawdown=0.0,
             halted=book.halted_at is not None,
+            halted_reason=book.halted_reason,
+            n_halts=len(book.halt_events),
         )
 
     returns = trades['return_on_stake'].to_numpy(dtype=float)
@@ -338,4 +382,6 @@ def summarise(book: Book, *, windows_available: int) -> BookStats:
         trades_per_year=trades_per_year, sharpe=sharpe,
         sharpe_per_trade=sharpe_per_trade, max_drawdown=drawdown,
         halted=book.halted_at is not None,
+        halted_reason=book.halted_reason,
+        n_halts=len(book.halt_events),
     )

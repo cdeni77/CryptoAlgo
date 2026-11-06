@@ -48,11 +48,6 @@ def _candidates() -> list[Path]:
     return found
 
 
-def test_git_is_available():
-    if not (REPO / '.git').exists():
-        pytest.skip('not a git checkout')
-
-
 def test_every_source_file_is_tracked():
     """A file the build reads and git does not know about is a broken clone."""
     if not (REPO / '.git').exists():

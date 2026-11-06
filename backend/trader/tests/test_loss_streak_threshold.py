@@ -29,5 +29,8 @@ def test_it_restores_the_alarm_rate_that_12_gives_at_even_odds():
 def test_the_money_breakers_are_untouched():
     """The money breakers (daily loss, ruin floor) are unchanged."""
     config = Config()
-    assert config.max_daily_loss_fraction == DEFAULT_CONFIG.max_daily_loss_fraction
+    # `DEFAULT_CONFIG` IS `Config()`, so comparing the two is 0.25 == 0.25 by
+    # construction and cannot fail. The number is pinned against CLAUDE.md
+    # instead, which is the agreement worth holding.
+    assert config.max_daily_loss_fraction == 0.25
     assert config.ruin_floor_fraction == 0.50

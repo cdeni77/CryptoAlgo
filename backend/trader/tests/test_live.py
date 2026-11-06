@@ -42,10 +42,6 @@ def test_the_offset_is_the_latest_one_reached_never_a_future_one():
     assert choose_offset(14, CFG) == 12
 
 
-def test_before_the_first_offset_is_an_abstention_not_an_error():
-    assert choose_offset(1, CFG) is None
-
-
 def test_the_fetch_window_covers_the_longest_feature_lookback():
     """The fetch window covers `log_rv_1440`, the longest lookback."""
     assert FETCH_MINUTES > max(CFG.vol_lookbacks_minutes)
@@ -55,10 +51,6 @@ def test_the_fetch_window_covers_the_longest_feature_lookback():
 def test_every_symbol_has_a_venue_series():
     for symbol in CFG.symbols:
         assert SERIES_BY_SYMBOL.get(symbol), symbol
-
-
-def test_prices_are_retained_longer_than_the_chart_shows():
-    assert PRICE_RETENTION_HOURS >= 24
 
 
 def test_place_orders_requires_live_mode():

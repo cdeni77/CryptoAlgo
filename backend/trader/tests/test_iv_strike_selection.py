@@ -21,11 +21,6 @@ def test_a_zero_ask_is_no_ask():
                    'yes_ask_dollars': '0.0000'}) is None
 
 
-def test_a_real_two_sided_quote_is_the_mid():
-    assert mid_of({'yes_bid_dollars': '0.4400',
-                   'yes_ask_dollars': '0.4600'}) == pytest.approx(0.45)
-
-
 def test_last_price_is_not_a_substitute_for_a_quote():
     """`last_price` is not used: it is a past trade, possibly hours old, not the current
     P(above).

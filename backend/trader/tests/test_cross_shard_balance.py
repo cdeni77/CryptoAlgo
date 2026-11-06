@@ -7,9 +7,11 @@ numbers, one of them invisible, and the difference looked like a sync fault.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 
 from core.pg_writer import _finite_or_none
+from data_collection.kalshi_client import KalshiClient
 
 
 class _Payload:
@@ -28,24 +30,39 @@ class _Payload:
     }
 
 
+def _key_pem() -> str:
+    """One throwaway key for the whole module: the constructor parses it, and
+    nothing below signs anything, so its content is irrelevant."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+_KEY_PEM = _key_pem()
+
+
 def _breakdown(payload: dict) -> dict:
-    """The parsing half of `KalshiClient.balance_breakdown`, without the socket."""
-    shards: dict[int, float] = {}
-    rows = payload.get('balance_breakdown')
-    if isinstance(rows, list):
-        for row in rows:
-            try:
-                shards[int(row.get('exchange_index', -1))] = float(row.get('balance'))
-            except (TypeError, ValueError):
-                pass
-    total = float('nan')
-    dollars = payload.get('balance_dollars')
-    if dollars is not None:
-        try:
-            total = float(dollars)
-        except (TypeError, ValueError):
-            pass
-    return {'total': total, 'shards': shards}
+    """Run `KalshiClient.balance_breakdown` against `payload`.
+
+    **Calls the production method, not a copy of it.** This helper used to be a
+    hand-written twin of the parsing half, so all four tests below passed with
+    `balance_breakdown` deleted outright -- the incident in the module
+    docstring had no guard at all. Only the socket is stubbed.
+    """
+    client = KalshiClient(key_id='k', private_key_pem=_KEY_PEM)
+
+    async def _request(method, path, **kw):
+        assert path == '/portfolio/balance', path
+        return payload
+
+    client._request = _request
+    return asyncio.run(client.balance_breakdown())
 
 
 def test_the_total_is_the_app_figure_and_the_shard_is_what_an_order_can_spend():

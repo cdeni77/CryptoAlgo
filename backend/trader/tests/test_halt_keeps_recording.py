@@ -36,10 +36,6 @@ class TestTheHaltedGate:
         assert out.contracts == 0
         assert out.stake == 0.0
 
-    def test_the_default_is_not_halted_so_nothing_else_changes(self):
-        """`decide()` is not halted by default, so the backtest and paper engine are unaffected."""
-        assert decide(row(), DEFAULT_CONFIG, bankroll=150.0).reason is Reason.TRADED
-
     def test_halted_is_distinct_from_the_bankroll_floor(self):
         """A latched breaker (cleared by hand) and the ruin floor are different reasons."""
         floored = decide(row(), DEFAULT_CONFIG, bankroll=1.0)

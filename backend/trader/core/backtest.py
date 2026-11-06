@@ -117,9 +117,21 @@ def run_book(
         if matured:
             book.settle({(p.symbol, p.window_open): outcomes[(p.symbol, p.window_open)]
                          for p in matured if (p.symbol, p.window_open) in outcomes})
-        if book.halted_at is not None:
+        # `is_halted` rather than `halted_at`: with `halt_resume_hours` set the
+        # book reopens after a cooling-off, which is what an operator does to a
+        # live halt. Unset, this is the same latch it always was.
+        if book.is_halted(window_open):
             continue
+        fills = _fill_lookup(rows) if getattr(config, 'simulate_fills', False) else None
         for decision in decide_window(rows, config, bankroll=book.bankroll):
+            # **Would anybody have crossed to this order?** The book otherwise
+            # records every decision as a position. Measured on this account's
+            # own tickets, the venue fills 86% as a taker and the 14% it misses
+            # are worth +9.05pp/contract against +0.97pp for the ones it gives
+            # you -- so assuming 100% keeps the profitable half of a trade that
+            # never happened.
+            if fills is not None and decision.traded:
+                decision = _apply_fill(decision, fills)
             decisions.append(decision)
             book.record(decision)
     # Anything still open at the end of the span settles on its own outcome.
@@ -127,6 +139,49 @@ def run_book(
         book.settle(outcomes)
     book.stateless_rejections = stateless_rejections
     return book, decisions
+
+
+
+def _fill_lookup(rows: pd.DataFrame) -> dict:
+    """(symbol, window_open, offset) -> the aggressor extremes while resting."""
+    need = ('symbol', 'window_open', 'offset_minutes', 'sell_low', 'buy_high')
+    if any(c not in rows.columns for c in need):
+        return {}
+    out = {}
+    for sym, win, off, lo, hi in zip(*(rows[c] for c in need)):
+        out[(sym, pd.Timestamp(win), int(off))] = (lo, hi)
+    return out
+
+
+def _apply_fill(decision: Decision, fills: dict) -> Decision:
+    """Refuse the decision when the simulated order would not have filled.
+
+    An uncovered row keeps the decision: `would_fill` returns None when the
+    tape does not reach it, and calling that a miss would delete trades the
+    data simply cannot speak to.
+    """
+    from core.fills import would_fill
+    key = (decision.symbol, pd.Timestamp(decision.window_open), int(decision.offset))
+    extremes = fills.get(key)
+    if extremes is None:
+        return decision
+    filled = would_fill(decision.symbol, decision.window_open, decision.offset,
+                        decision.side.value if decision.side else 'up',
+                        decision.price, extremes[0], extremes[1])
+    if filled is False:
+        return dataclasses.replace(decision, reason=Reason.NO_FILL,
+                                   contracts=0, stake=0.0, fee=0.0)
+    return decision
+
+
+
+def _member_trees(model) -> Optional[tuple[int, ...]]:
+    """Every ensemble member's kept tree count, or None if unavailable."""
+    trees = getattr(model, 'member_trees', None)
+    if trees:
+        return tuple(trees)
+    single = getattr(model, 'best_iteration', None)
+    return (int(single),) if single else None
 
 
 def skill_null_column(table: pd.DataFrame, init_score_source: str) -> np.ndarray:
@@ -298,6 +353,9 @@ def walk_forward(
             residual_scale=model.residual_scale,
             control_gain_share=model.control_importance_share,
             stats=stats,
+            # The ENSEMBLE's counts, not member 0's: `best_iteration` is one
+            # member of five and can call a healthy ensemble degenerate.
+            n_trees=_member_trees(model),
         ))
         logger.info(evaluations[-1].line())
 

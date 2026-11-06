@@ -46,9 +46,15 @@ def test_the_grid_only_lands_on_quarter_hours():
 
 def test_batches_never_exceed_the_endpoints_ceiling():
     """Batches never exceed 50 slugs: the endpoint rejects 100 with HTTP 422."""
+    # **Read the production constant.** This hard-coded 50, so raising
+    # SLUGS_PER_REQUEST to 100 left it green while every request 422'd -- the
+    # opposite of what the docstring promises.
+    from research.collect.catalog import SLUGS_PER_REQUEST
+
+    assert SLUGS_PER_REQUEST <= 50, 'the endpoint rejects more than 50 slugs'
     items = list(range(137))
-    chunks = list(batched(items, 50))
-    assert [len(c) for c in chunks] == [50, 50, 37]
+    chunks = list(batched(items, SLUGS_PER_REQUEST))
+    assert max(len(c) for c in chunks) <= SLUGS_PER_REQUEST
 
 
 def test_batching_preserves_every_item_exactly_once():

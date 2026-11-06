@@ -385,7 +385,15 @@ async def store_sync_loop(*, every: float = 3600.0) -> None:
                      # from Coinbase bars; the venue's own settlement disagrees
                      # on ~2.85% of windows and moves model_minus_market from
                      # +0.000924 to +0.000188. Idempotent, so a re-run is free.
-                     ('scripts.correct_outcomes',)):
+                     ('scripts.correct_outcomes',),
+                     # **The venue's own strike, for the same reason.** It was
+                     # a one-off command nobody ran: measured 2026-11-05 it was
+                     # 99 hours stale while the loop traded happily, and because
+                     # `--strike-source venue` builds every window from it, the
+                     # TRAINING set silently stopped four days short of the
+                     # present. Idempotent -- it skips windows it already holds,
+                     # so an hourly pass is a dozen requests.
+                     ('scripts.backfill_markets',)):
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, '-m', *step,
                 stdout=asyncio.subprocess.DEVNULL,

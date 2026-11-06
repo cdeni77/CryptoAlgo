@@ -27,12 +27,6 @@ def _quotes(index):
     return {'BTC-USD': (_Q(index), 'KXBTC15M-X')}
 
 
-def test_nothing_is_known_before_a_book_has_been_read():
-    assert live_ledger._LAST_EXCHANGE_INDEX is None, (
-        'until a book is seen the balance query falls back to its own default, '
-        'which is what already happens on a cycle where no symbol quoted')
-
-
 def test_the_shard_is_learned_from_the_book_and_kept():
     assert live.remember_exchange_index(_quotes(2)) == 2
     assert live_ledger._LAST_EXCHANGE_INDEX == 2

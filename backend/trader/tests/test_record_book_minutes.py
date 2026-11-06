@@ -129,23 +129,21 @@ def test_the_sleep_re_establishes_the_minute_phase():
     refused for six hours, while the heartbeat kept stamping because it marks
     liveness, not success.
 
-    The sleep must therefore be computed from the CLOCK, not from a constant.
+    **Calls the production function.** This test used to define its own copy of
+    the formula, so reverting the loop to `sleep(PERIOD_SECONDS)` -- the exact
+    regression above -- left all nine tests in this file green.
     """
-    from scripts.record_book_minutes import PERIOD_SECONDS
+    from scripts.record_book_minutes import PERIOD_SECONDS, wait_seconds
 
-    def wait_from(now):
-        return max(0.5, PERIOD_SECONDS - (now % PERIOD_SECONDS))
+    # Phase is re-established wherever in the minute the work finished.
+    for second in (0.0, 0.045, 13.7, 59.2):
+        landed = (second + wait_seconds(second)) % PERIOD_SECONDS
+        assert landed == pytest.approx(0.0, abs=1e-9), second
 
-    # From any phase, the next wake lands on a boundary.
-    for now in (1000.0, 1000.04, 1012.5, 1059.9, 1059.999):
-        assert abs((now + wait_from(now)) % PERIOD_SECONDS) < 1e-6 or \
-            wait_from(now) == 0.5, now
-
-    # And the drift does NOT accumulate across many cycles with work in them.
-    now, work = 960.0, 0.045
-    for _ in range(200):
-        now += work + wait_from(now + work)
-    assert (now % PERIOD_SECONDS) < 0.5, 'phase drifted to %.3fs' % (now % PERIOD_SECONDS)
+    # It is never the bare period: that is the drift this guards.
+    assert wait_seconds(0.045) < PERIOD_SECONDS
+    # And never zero, or the loop spins when the work overran the boundary.
+    assert wait_seconds(59.999) >= 0.5
 
 
 def test_a_fixed_period_sleep_would_have_drifted_past_the_threshold():

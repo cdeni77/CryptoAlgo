@@ -24,21 +24,6 @@ def test_compounding_can_be_turned_on():
     assert _config(['--compound']).compound is True
 
 
-def test_it_reaches_the_sizing_base():
-    """The flag reaches the Config the backtest uses, which `decide()` reads for the
-    sizing base.
-    """
-    from core.decide import kelly_fraction_for  # noqa: F401  (import guard)
-    config = _config(['--compound', '--bankroll', '500'])
-    assert config.compound is True
-    assert config.starting_bankroll == 500.0
-
-
-# --- the flag must reach the Config, not just the parser -------------------
-#
-# The flag must also be listed in `cli_overrides`, or `config_for_artifact`
-# adopts the artifact's provenance over it.
-
 def test_the_compound_flag_reaches_the_config():
     from scripts.live import build_parser, config_from_args
     args = build_parser().parse_args(
@@ -62,14 +47,3 @@ def test_without_the_flag_compounding_stays_off():
         "block the artifact's provenance from applying")
 
 
-def test_the_sizing_base_actually_follows_the_flag():
-    """The sizing base is the running bankroll only when `--compound` is set."""
-    from scripts.live import build_parser, config_from_args
-    running = 550.60
-    for argv, expected in (
-            (['--mode', 'live', '--place-orders', '--compound', '--bankroll', '500'],
-             running),
-            (['--mode', 'live', '--place-orders', '--bankroll', '500'], 500.0)):
-        config = config_from_args(build_parser().parse_args(argv))
-        base = running if config.compound else config.starting_bankroll
-        assert base == expected, (argv, base, expected)

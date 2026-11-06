@@ -60,14 +60,6 @@ def test_it_backs_off_rather_than_raising_on_a_thin_subset():
     assert focused == pytest.approx(_fit_residual_scale(base, corr, y))
 
 
-def test_the_ranking_does_not_depend_on_alpha():
-    """Alpha scales the correction, so the order of |correction| does not change."""
-    _, corr, _ = _sample()
-    order = np.argsort(np.abs(corr))
-    for alpha in (0.25, 1.0, 1.9):
-        assert np.array_equal(np.argsort(np.abs(alpha * corr)), order)
-
-
 def test_the_ceiling_is_respected():
     """`max_scale` caps alpha; a value above 1 would amplify the correction, a sign of
     overfitting.

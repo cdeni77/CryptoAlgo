@@ -1,5 +1,6 @@
 """Tests that the per-symbol bar fetches run concurrently, since they are independent."""
 from __future__ import annotations
+import dataclasses
 
 import asyncio
 import time
@@ -8,6 +9,13 @@ import pytest
 
 from core.config import DEFAULT_CONFIG
 from livetrade import bars as live_bars
+
+# **Pinned to spot.** These cover the SPOT fetch mechanics -- the cache and the
+# concurrency -- not the settlement index. The default series became the index
+# on 2026-11-05, which routes through `_overlay_index` and would make these
+# assert something they do not mean.
+DEFAULT_CONFIG = dataclasses.replace(DEFAULT_CONFIG, venue='coinbase_spot')
+
 
 
 class _Client:

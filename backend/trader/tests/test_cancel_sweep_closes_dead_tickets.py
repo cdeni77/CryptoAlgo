@@ -42,9 +42,14 @@ class Kalshi:
     def __init__(self, error):
         self.error = error
         self.attempts = []
+        self.tickers = []
 
-    async def cancel_order(self, order_id):
+    async def cancel_order(self, order_id, *, market_ticker=None):
+        # Mirrors `KalshiClient.cancel_order`. A fake that drops an argument the
+        # real client requires passes while the live path raises TypeError --
+        # which is how a cancel that never worked went unnoticed.
         self.attempts.append(order_id)
+        self.tickers.append(market_ticker)
         if self.error:
             raise self.error
         return {}

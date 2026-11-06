@@ -62,6 +62,22 @@ FLUSH_EVERY_SAMPLES = 15
 PERIOD_SECONDS = 60.0
 
 
+def wait_seconds(now: float) -> float:
+    """Seconds to sleep so the NEXT cycle lands on the minute boundary.
+
+    Computed from the clock, never from a constant. `sleep(PERIOD_SECONDS)`
+    runs after the work, so each cycle costs the period PLUS however long
+    sampling took, and the phase walks. A floor of 0.5s keeps the loop from
+    spinning when the work already overran the boundary.
+
+    Extracted so a test can call the real expression. It lived inline, and the
+    test that records the incident defined its own copy of the formula --
+    verified 2026-10-28 by reverting this line to `sleep(PERIOD_SECONDS)`, the
+    exact regression, with all nine tests in the file still green.
+    """
+    return max(0.5, PERIOD_SECONDS - (now % PERIOD_SECONDS))
+
+
 def _symbol_for(ticker: str):
     """`KXBTC15M-...` -> `BTC-USD`, or None for a series we do not trade.
 
@@ -256,5 +272,4 @@ async def run(args=None) -> int:
         # here: it is the entire reason this component exists (see the module
         # docstring), so it has to be re-established every cycle rather than
         # assumed to hold.
-        now = time.time()
-        await asyncio.sleep(max(0.5, PERIOD_SECONDS - (now % PERIOD_SECONDS)))
+        await asyncio.sleep(wait_seconds(time.time()))

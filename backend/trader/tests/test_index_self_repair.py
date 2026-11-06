@@ -114,7 +114,9 @@ def test_the_default_venue_is_untouched(monkeypatch):
     spot = {'BTC-USD': _frame(10)}
     monkeypatch.setattr(bars_mod, '_index_overlay_sync',
                         lambda c, s, m: pytest.fail('overlay ran off-index'))
-    out = asyncio.run(bars_mod._overlay_index(Config(), spot, 1500))
+    # Explicit, not the default: the default venue IS the index now, so
+    # inheriting it would make this test assert the opposite of its name.
+    out = asyncio.run(bars_mod._overlay_index(Config(venue='coinbase_spot'), spot, 1500))
     assert out is spot
 
 

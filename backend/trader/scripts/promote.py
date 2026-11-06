@@ -144,6 +144,37 @@ def refit_on_all(dataset, config, *, groups=None):
         return None
 
 
+def shipping_alpha(refit_alpha, walk_median, ceiling: float = 1.0):
+    """The shrinkage the artifact ships, and why it is the walk-forward's.
+
+    Alpha is one scalar. The walk-forward fits it out of sample on every fold;
+    the refit re-fits it on the second half of its inner holdout -- about 10%
+    of the training windows, roughly a week. Selecting a hyperparameter by
+    cross-validation and then refitting the MODEL on all data is standard;
+    re-estimating the HYPERPARAMETER on a small recent tail and letting that
+    override the cross-validation is not.
+
+    It is also an unstable estimator -- a ratio whose numerator is noise
+    centred on zero when skill is absent, clipped to a bound -- so a quiet week
+    sends it to 0 or to the ceiling. Across 31 promotions, 52% sat at the
+    ceiling and 14% at the floor with almost nothing between.
+
+    The cost was total: a deployed alpha near zero makes the model emit the
+    market price, so every edge is exactly minus the fee and the artifact
+    cannot place a single trade, while its own walk-forward reports alpha 1.000
+    and positive fold skill.
+
+    Returns `(alpha, source)`. Falls back to the refit only when the
+    walk-forward produced nothing usable, and says so.
+    """
+    ceiling = float(ceiling or 1.0)
+    if walk_median is not None and np.isfinite(walk_median):
+        return float(min(max(float(walk_median), 0.0), ceiling)), 'walk-forward'
+    if refit_alpha is not None and np.isfinite(refit_alpha):
+        return float(min(max(float(refit_alpha), 0.0), ceiling)), 'refit'
+    return None, 'none'
+
+
 def choose_candidate(fold_models, refit):
     """Return the artifact to deploy: the refit on all data, not the last fold.
 
@@ -294,13 +325,47 @@ def main() -> int:
     # walk-forward's; this is the deployed refit's own alpha. They disagreed by
     # two orders of magnitude on 2026-10-18 (0.940 gated, 0.015 installed), and
     # nothing noticed because no gate read the candidate.
+    # **The walk-forward's alpha SHIPS, not the refit's own.**
+    #
+    # Alpha is one scalar. The walk-forward fits it out of sample on every
+    # fold -- 6,149 windows across six blocks -- while the refit re-fits it on
+    # the second half of its inner holdout, about 614 windows, roughly one
+    # week. Selecting a hyperparameter by cross-validation and then refitting
+    # the MODEL on all data is standard; re-estimating the HYPERPARAMETER on a
+    # small recent tail and letting that override the cross-validation is not.
+    #
+    # It is also an unstable estimator: alpha is a ratio whose numerator is
+    # noise centred on zero when skill is absent, clipped to [0, max], so a
+    # quiet week sends it to a bound. Measured across 31 promotions, 52% sat at
+    # the ceiling and 14% at the floor with almost nothing between.
+    #
+    # The cost was total. A deployed alpha of ~0 makes the model emit the
+    # market price, so every edge is exactly minus the fee and the artifact
+    # cannot place a single trade -- while its own walk-forward reported alpha
+    # 1.000 and positive fold skill. Every run on 2026-11-05 shipped 0.00001
+    # against a walk-forward median of 0.96-1.00, and `deployed_residual_scale`
+    # failed on all of them and was forced past.
+    refit_alpha = getattr(candidate, 'residual_scale', None)
+    walk = getattr(result.report, 'median_residual_scale', None)
+    shipped, source = shipping_alpha(
+        refit_alpha, walk, getattr(config, 'max_residual_scale', 1.0))
+    if shipped is not None:
+        if refit_alpha is not None:
+            market['refit_residual_scale'] = float(refit_alpha)
+            candidate.refit_residual_scale = float(refit_alpha)
+        candidate.residual_scale = shipped
+        logger.info(
+            'deployed alpha %.5f from the %s; the refit\'s own %.5f is kept as '
+            'a diagnostic (refit_residual_scale)', shipped, source,
+            float(refit_alpha) if refit_alpha is not None else float('nan'))
+        if source == 'refit':
+            logger.warning(
+                'the walk-forward produced no median alpha, so the refit\'s own '
+                'ships. It is fitted on ~10%% of the training windows and is the '
+                'less trustworthy of the two.')
     deployed_alpha = getattr(candidate, 'residual_scale', None)
     if deployed_alpha is not None:
         market['deployed_residual_scale'] = float(deployed_alpha)
-        walk = getattr(result.report, 'residual_scale', None)
-        logger.info('deployed artifact alpha %.4f%s', float(deployed_alpha),
-                    f' against the walk-forward\'s {float(walk):.4f}'
-                    if walk is not None else '')
     if refit is not None:
         print(f'  deploying a refit on {refit.n_train_windows:,} windows, '
               f'against the last fold\'s {result.models[-1].n_train_windows:,}')

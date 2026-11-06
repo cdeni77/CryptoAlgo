@@ -83,7 +83,15 @@ def series_to_symbol() -> dict[str, str]:
 class Config:
     # ---- universe and market structure -----------------------------------
     symbols: tuple[str, ...] = ('BTC-USD', 'ETH-USD', 'SOL-USD')
-    venue: str = 'coinbase_spot'
+    # **CF Benchmarks BRTI, not Coinbase.** The markets settle on BRTI and
+    # price on it; Coinbase is a different series. The basis is white noise
+    # at the window scale (sd 0.96bp, 15-minute autocorrelation +0.094), so
+    # it does NOT cancel between the strike and the decision -- ~1.29bp
+    # reaches displacement, which at +12m against ~8bp of remaining sigma is
+    # ~6pp of probability error against a 1.5pp target edge. Read by
+    # `core/dataset.load_minute_bars` to pick the bar series; bars for both
+    # venues live in `minute_bars` under their own `venue`.
+    venue: str = 'cfbenchmarks'
     timeframe: str = '1m'
 
     # A Kalshi crypto up/down market opens on a quarter-hour boundary and
@@ -702,6 +710,14 @@ class Config:
     # most of its edge — while `--complete-cases` already requires the peer in
     # training, so this is what makes live agree.
     require_peer_book: bool = False
+    # **Simulate whether a resting order would actually have filled.**
+    # OFF by default because it needs `venue_trades` joined onto the rows;
+    # without the tape every row scores NaN and the book refuses everything.
+    # The backtest otherwise books 100% of orders while the venue fills 86%
+    # as a taker -- and the 14% it misses are worth +9.05pp/contract against
+    # +0.97pp for the ones it gives you, so the optimism is concentrated
+    # entirely in the winners.
+    simulate_fills: bool = False
     # Place orders only while this exact artifact version is loaded. A row
     # scored by any other model is refused `model_not_pinned`, so a failed
     # reload or an unreviewed retrain cannot trade. None disables the check.

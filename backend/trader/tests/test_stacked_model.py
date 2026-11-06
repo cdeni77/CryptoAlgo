@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from core.baseline import expit, logit
-from core.config import Config
+from core.config import Config, DEFAULT_CONFIG
 from core.dataset import Dataset, apply_fold, fit_fold
 from core.model import (
     MARKET_LOGIT, ForecastModel, StackedForecastModel, _fit_stack,
@@ -269,7 +269,11 @@ def test_scripts_evaluate_runs_end_to_end_in_stack_mode(tmp_path, monkeypatch, c
     bars = make_bars(days=26, lead=0.9, seed=5)
     for symbol, frame in bars.items():
         store.write('minute_bars', frame.assign(
-            venue='coinbase_spot', symbol=symbol, available_time=frame['event_time'],
+            # The series the run will ASK for, not a hard-coded one: the default
+            # became the settlement index on 2026-11-05 and a fixture that
+            # writes spot leaves the reader with no bars at all.
+            venue=DEFAULT_CONFIG.venue, symbol=symbol,
+            available_time=frame['event_time'],
             quality='valid'))
     depth = make_depth(bars, FAST, quoted_days=15)
     store.write('venue_depth', depth.assign(quality='valid'))

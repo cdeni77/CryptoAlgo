@@ -61,6 +61,7 @@ class Reason(str, Enum):
     BANKROLL_FLOOR = 'bankroll_floor'          # stop-trading floor breached
     HALTED = 'halted'                          # a circuit breaker is latched
     MODEL_NOT_PINNED = 'model_not_pinned'      # not the model pinned for trading
+    NO_FILL = 'no_fill'                        # simulated: nobody crossed to the order
 
 
 @dataclass(frozen=True)
@@ -537,7 +538,8 @@ def decide(
     # both legs is lost. Refusing is also the honest reading: the model has
     # changed its mind, and with hold-to-settle there is no exit to take.
     held = exposure.side_for(symbol)
-    if held is not None and held != str(side.value):
+    if (held is not None and held != str(side.value)
+            and not getattr(config, 'allow_opposite_side', False)):
         return refuse(Reason.OPPOSITE_SIDE)
     price = float(price_a[0])
     probability = float(probability_a[0])

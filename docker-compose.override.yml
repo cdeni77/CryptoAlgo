@@ -9,7 +9,22 @@ services:
       - "60"
       - --mode
       - live
-      - --place-orders
+      # **The price basis is ADOPTED, not stated.** `venue`, `strike_source`
+      # and `label_source` come from the installed artifact's provenance via
+      # `livetrade.artifact.config_for_artifact`, so the trader follows a
+      # migrated model automatically. Setting them here would mark them
+      # `explicit`, which DISABLES that adoption and freezes the trader on
+      # today's basis -- the next artifact fitted elsewhere would then be
+      # refused by the provenance check instead of followed. They are in
+      # that check (`core/model.py`) precisely so a divergence cannot pass
+      # silently, which is how the 2026-10-22 BRTI model was lost.
+      # **DRY RUN, set 2026-11-05 at the operator's request.** Reads the real
+      # book and decides, but places nothing. The backtest books resting
+      # orders that would never have filled -- the 12% that do not fill are
+      # worth +8.02pp/contract against -0.93pp for the ones that do -- so
+      # every backtest figure is an upper bound the account cannot reach.
+      # Restore --place-orders only after fills are simulated from the tape.
+      - --dry-run
       - --compound
       # **$400, because the operator withdrew cash for sports bets on
       # 2026-11-01.** The floor is `starting_bankroll * 0.50`, so a
@@ -36,7 +51,7 @@ services:
       # Must match the `retrain` service, or the gates grade a policy the
       # account does not run.
       - --min-edge-pp
-      - "0.5"
+      - "0.1"
       - --kelly-fraction
       - "0.10"
       - --entry-offsets
@@ -44,7 +59,10 @@ services:
       - "6"
       - "9"
       - "12"
-      - --require-peer-book
+      # `--require-peer-book` removed with `cross_venue`: it refused ~10% of
+      # live decisions for a missing peer the model no longer reads.
+      # `config_for_artifact` re-enables it automatically if an artifact's
+      # groups contain cross_venue again, so this is not a one-way door.
       # **Pinned, so the Sunday retrain cannot swap the model underneath a
       # measurement.** The execution fix of 2026-10-26 (post_only, resting at
       # the bid) is the one change with a verified mechanism and its effect on
@@ -123,19 +141,25 @@ services:
       # at the bid and we join behind them. A session with zero fills is a
       # RESULT, not a fault. The gates are scored at the ask on purpose, so
       # they bound this from below rather than banking the assumption.
-      - --maker-entry
+      # **Maker entry OFF, 2026-11-05.** Measured over both eras on this
+      # account's own fills: resting saved 0.94pp/contract of taker fee and
+      # cost 1.85pp of gross edge to adverse selection, a net -0.91pp -- which
+      # is the whole taker-to-maker swing (-0.66 -> -1.57pp/ct). Filled resting
+      # orders are -0.93pp gross against +0.97pp for taker fills, and the
+      # selection gap is 21.1pp against 8.1pp. Resting pays a market maker's
+      # cost and earns none of a market maker's revenue, because there is no
+      # exit path: the position is held to settlement, so the spread is never
+      # captured on a round trip. Do not switch this back on without two-sided
+      # quoting and an exit.
       # **Make when we can, take when we can.** post_only refused 23.7% of
       # orders and left the fills it allowed adversely selected: measured
       # side by side, resting fills realised -0.48pp per contract against
       # -0.13pp for crossing fills net of the taker fee. The orders it
       # refused would have won 95.3% of the time. Still priced at our own
       # touch, so it rests whenever the book lets it.
-      - --no-post-only
       # Pull an unfilled order after 60s of its OWN age. The forecast is what
       # expires -- `sigma_remaining` is computed for the decision instant -- so
       # a fill arriving minutes later takes an edge that has already moved.
-      - --maker-cancel-seconds
-      - "60"
       # **EXPERIMENT, 2026-10-20: one entry per offset instead of per window.**
       # `already_entered` was 43.5% of all refusals (956 decisions), and the
       # operator asked to see what the system does without it.

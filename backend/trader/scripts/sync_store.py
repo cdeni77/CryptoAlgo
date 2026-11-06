@@ -20,7 +20,10 @@ from core.datastore import BARS_DATASET_BY_TIMEFRAME, ResearchStore, from_sqlite
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--db-path', type=str, default='./data/trading.db')
-    parser.add_argument('--venue', type=str, default=DEFAULT_CONFIG.venue,
+    # Pinned, NOT `DEFAULT_CONFIG.venue`: these are legacy sqlite bars and they
+    # came from Coinbase. Following the config default would stamp them with
+    # whatever series the model currently reads, which they are not.
+    parser.add_argument('--venue', type=str, default='coinbase_spot',
                         help='Label for rows that recorded none. Rows that kept '
                              'their own venue keep it.')
     parser.add_argument('--timeframe', type=str, default=DEFAULT_CONFIG.timeframe)
